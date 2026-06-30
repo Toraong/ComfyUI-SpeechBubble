@@ -224,23 +224,59 @@ def _perturb(pts: List[Tuple[float, float]], sigma: float, rng: random.Random) -
 # ─── Text wrapping ────────────────────────────────────────────────────────────
 
 def _wrap_text(draw: ImageDraw.ImageDraw, text: str, font, max_w: int) -> List[str]:
+    if max_w <= 0:
+        max_w = 1
     lines: List[str] = []
     for para in text.split("\n"):
-        words = para.split()
-        if not words:
+        if not para:
             lines.append("")
             continue
-        cur = ""
+        
+        cur_line = ""
+        words = para.split(" ")
         for word in words:
-            test = (cur + " " + word).strip()
-            bb = draw.textbbox((0, 0), test, font=font)
-            if bb[2] - bb[0] <= max_w or not cur:
-                cur = test
+            if not word:
+                if cur_line:
+                    test_space = cur_line + " "
+                    bb = draw.textbbox((0, 0), test_space, font=font)
+                    if bb[2] - bb[0] <= max_w:
+                        cur_line = test_space
+                    else:
+                        lines.append(cur_line)
+                        cur_line = ""
+                continue
+
+            test_line = (cur_line + " " + word) if cur_line else word
+            bb = draw.textbbox((0, 0), test_line, font=font)
+            if bb[2] - bb[0] <= max_w:
+                cur_line = test_line
             else:
-                lines.append(cur)
-                cur = word
-        if cur:
-            lines.append(cur)
+                bb_word = draw.textbbox((0, 0), word, font=font)
+                if bb_word[2] - bb_word[0] <= max_w:
+                    if cur_line:
+                        lines.append(cur_line)
+                    cur_line = word
+                else:
+                    if cur_line:
+                        test_space = cur_line + " "
+                        bb_space = draw.textbbox((0, 0), test_space, font=font)
+                        if bb_space[2] - bb_space[0] <= max_w:
+                            cur_line = test_space
+                        else:
+                            lines.append(cur_line)
+                            cur_line = ""
+                    
+                    for char in word:
+                        test_char = cur_line + char
+                        bb_char = draw.textbbox((0, 0), test_char, font=font)
+                        if bb_char[2] - bb_char[0] <= max_w:
+                            cur_line = test_char
+                        else:
+                            if cur_line:
+                                lines.append(cur_line)
+                            cur_line = char
+        if cur_line:
+            lines.append(cur_line)
     return lines
 
 
@@ -358,8 +394,8 @@ class SpeechBubbleNode:
                 "image":       ("IMAGE",),
                 "text":        ("STRING", {"default": "Hello!", "multiline": True}),
                 # ── Bubble geometry ──────────────────────────────────────
-                "bubble_x":    ("INT", {"default": 50,  "min": 0,     "max": 8192, "step": 1}),
-                "bubble_y":    ("INT", {"default": 50,  "min": 0,     "max": 8192, "step": 1}),
+                "bubble_x":    ("INT", {"default": 50,  "min": -8192, "max": 8192, "step": 1}),
+                "bubble_y":    ("INT", {"default": 50,  "min": -8192, "max": 8192, "step": 1}),
                 "bubble_w":    ("INT", {"default": 260, "min": 10,    "max": 8192, "step": 1}),
                 "bubble_h":    ("INT", {"default": 130, "min": 10,    "max": 8192, "step": 1}),
                 # ── Tail tip position (꼬리 끝 좌표) ─────────────────────
@@ -482,8 +518,8 @@ class SpeechBubbleSettingsNode:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "bubble_x": ("INT", {"default": 50,  "min": 0,     "max": 8192}),
-                "bubble_y": ("INT", {"default": 50,  "min": 0,     "max": 8192}),
+                "bubble_x": ("INT", {"default": 50,  "min": -8192, "max": 8192}),
+                "bubble_y": ("INT", {"default": 50,  "min": -8192, "max": 8192}),
                 "bubble_w": ("INT", {"default": 260, "min": 10,    "max": 8192}),
                 "bubble_h": ("INT", {"default": 130, "min": 10,    "max": 8192}),
                 "tail_x":   ("INT", {"default": 180, "min": -8192, "max": 8192}),
