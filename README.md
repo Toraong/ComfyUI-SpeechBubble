@@ -24,7 +24,7 @@
 1. ComfyUI의 custom_nodes 폴더 아래로 이 저장소를 클론하거나 압축을 해제합니다.
    ```bash
    cd ComfyUI/custom_nodes/
-   git clone https://github.com/사용자이름/ComfyUI-SpeechBubble.git
+   git clone https://github.com/Toraong/ComfyUI-SpeechBubble.git
    ```
 
 2. 해당 폴더 내의 필요한 파이썬 패키지를 설치합니다. (Pillow, numpy, torch 필요)
