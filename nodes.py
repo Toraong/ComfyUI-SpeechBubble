@@ -660,118 +660,195 @@ class SpeechBubbleExtractorNode:
             if text.strip():
                 draw = ImageDraw.Draw(empty_bubble, "RGBA")
                 text_c = _hex_rgba(font_color, 255)
-                
-                # Find vertical range and average width of the bubble mask
-                row_indices = np.where(np.sum(eroded_mask > 0, axis=1) > 0)[0]
-                if len(row_indices) > 0:
-                    y_min, y_max = row_indices[0], row_indices[-1]
-                    row_widths = np.sum(eroded_mask > 0, axis=1)
-                    valid_row_widths = row_widths[row_widths > 0]
-                    avg_width = np.mean(valid_row_widths)
-                else:
-                    y_min, y_max = 0, bubble_rgba.height
-                    avg_width = bubble_rgba.width
-                
-                # Bounding box coordinates for fallbacks
-                contours, _ = cv2.findContours(eroded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                if contours:
-                    c = max(contours, key=cv2.contourArea)
-                    bx, by, bw, bh = cv2.boundingRect(c)
-                else:
-                    bx, by, bw, bh = 0, 0, bubble_rgba.width, bubble_rgba.height
-                
-                current_size = font_size
-                min_size = 6
-                
-                # Auto-adjust font size
-                while current_size >= min_size:
-                    font = _load_font(font_name, current_size)
-                    
-                    # Wrap text based on average width
-                    wrap_w = max(50, int(avg_width - 2 * padding))
-                    lines = _wrap_text(draw, text, font, wrap_w)
-                    L = len(lines)
-                    
-                    if L == 0:
-                        break
-                    
-                    # Test drawing
-                    test_img = Image.new("L", (empty_bubble.width, empty_bubble.height), 0)
-                    test_draw = ImageDraw.Draw(test_img)
-                    
-                    bb0 = test_draw.textbbox((0, 0), "Ag", font=font)
-                    line_h = bb0[3] - bb0[1]
-                    total_h = L * line_h + (L - 1) * line_spacing
-                    
-                    cy = (y_min + y_max) / 2.0
-                    sy = cy - total_h / 2.0
-                    
-                    # For each line, compute its Y and X position
-                    for i, line in enumerate(lines):
-                        if not line:
+
+                # ── Helper: find safe per-row wrap width ──────────────────────
+                def _row_safe_wrap_w(mask: np.ndarray, y0: int, y1: int, pad: int) -> int:
+                    """Return the minimum contiguous run width in [y0,y1] rows, minus 2*pad."""
+                    y0c = max(0, y0)
+                    y1c = min(mask.shape[0], y1)
+                    if y0c >= y1c:
+                        return 1
+                    region = mask[y0c:y1c, :]
+                    col_on = np.any(region > 0, axis=0)
+                    cols = np.where(col_on)[0]
+                    if len(cols) == 0:
+                        return 1
+                    return max(1, int(cols[-1] - cols[0]) - 2 * pad)
+
+                # ── Helper: draw text block in one region ─────────────────────
+                def _draw_text_in_region(
+                    drw: ImageDraw.ImageDraw,
+                    region_mask: np.ndarray,
+                    full_mask: np.ndarray,
+                    region_text: str,
+                    f_name: str, f_size: int, f_color,
+                    pad: int, sp: int,
+                    test_only: bool = False,
+                ) -> Tuple[bool, int]:
+                    """
+                    Draw (or test-draw) region_text centred inside the region defined
+                    by region_mask, auto-shrinking font until no overflow.
+                    Returns (overflow_occurred, final_font_size).
+                    """
+                    row_idx = np.where(np.sum(region_mask > 0, axis=1) > 0)[0]
+                    if len(row_idx) == 0:
+                        return False, f_size
+
+                    ry_min, ry_max = int(row_idx[0]), int(row_idx[-1])
+
+                    # bounding-box fallback cx
+                    col_idx_all = np.where(np.any(region_mask > 0, axis=0))[0]
+                    fb_cx = (int(col_idx_all[0]) + int(col_idx_all[-1])) / 2.0 if len(col_idx_all) else region_mask.shape[1] / 2.0
+
+                    cur_sz = f_size
+                    while cur_sz >= 6:
+                        fnt = _load_font(f_name, cur_sz)
+                        # wrap based on min row width in the vertical centre slice
+                        mid_y0 = ry_min + (ry_max - ry_min) // 4
+                        mid_y1 = ry_max - (ry_max - ry_min) // 4
+                        ww = _row_safe_wrap_w(region_mask, mid_y0, mid_y1, pad)
+                        lns = _wrap_text(drw, region_text, fnt, ww)
+                        if not lns:
+                            cur_sz -= 1
                             continue
-                        
-                        ly = sy + i * (line_h + line_spacing)
-                        
-                        # Get horizontal center of the mask in this line's vertical range
-                        zone_y_min = ly
-                        zone_y_max = ly + line_h
-                        
-                        zone_mask = eroded_mask[max(0, int(zone_y_min)):min(eroded_mask.shape[0], int(zone_y_max)), :]
-                        col_indices = np.where(np.any(zone_mask > 0, axis=0))[0]
-                        if len(col_indices) > 0:
-                            x_start = col_indices[0] + padding
-                            x_end = col_indices[-1] - padding
-                            cx = (x_start + x_end) / 2.0
-                        else:
-                            cx = bx + bw / 2.0
-                        
-                        bb = test_draw.textbbox((0, 0), line, font=font)
-                        lx = cx - (bb[2] - bb[0]) / 2.0
-                        test_draw.text((lx, ly), line, fill=255, font=font)
-                    
-                    test_np = np.array(test_img)
-                    overflow_pixels = np.any((test_np > 0) & (eroded_mask == 0))
-                    
-                    if not overflow_pixels:
-                        break
-                    
-                    current_size -= 1
-                
-                # Draw the final text using the determined font size
-                font = _load_font(font_name, current_size)
-                wrap_w = max(50, int(avg_width - 2 * padding))
-                lines = _wrap_text(draw, text, font, wrap_w)
-                L = len(lines)
-                
-                bb0 = draw.textbbox((0, 0), "Ag", font=font)
-                line_h = bb0[3] - bb0[1]
-                total_h = L * line_h + (L - 1) * line_spacing
-                
-                cy = (y_min + y_max) / 2.0
-                sy = cy - total_h / 2.0
-                
-                for i, line in enumerate(lines):
-                    if not line:
+
+                        bb0 = drw.textbbox((0, 0), "Ag", font=fnt)
+                        lh = bb0[3] - bb0[1]
+                        th = len(lns) * lh + (len(lns) - 1) * sp
+
+                        rcy = (ry_min + ry_max) / 2.0
+                        rsy = rcy - th / 2.0
+
+                        # Test render into a temp L image
+                        tmp = Image.new("L", (region_mask.shape[1], region_mask.shape[0]), 0)
+                        tmp_drw = ImageDraw.Draw(tmp)
+                        for ii, ln in enumerate(lns):
+                            if not ln:
+                                continue
+                            ly = rsy + ii * (lh + sp)
+                            # get per-row horizontal center from region mask
+                            zym0 = max(0, int(ly))
+                            zym1 = min(region_mask.shape[0], int(ly + lh))
+                            zm = region_mask[zym0:zym1, :]
+                            rc = np.where(np.any(zm > 0, axis=0))[0]
+                            if len(rc) > 0:
+                                lcx = (int(rc[0]) + pad + int(rc[-1]) - pad) / 2.0
+                            else:
+                                lcx = fb_cx
+                            bb = tmp_drw.textbbox((0, 0), ln, font=fnt)
+                            lx = lcx - (bb[2] - bb[0]) / 2.0
+                            tmp_drw.text((lx, ly), ln, fill=255, font=fnt)
+
+                        tmp_np = np.array(tmp)
+                        # Check overflow against the FULL eroded mask (prevents crossing into neighbour region)
+                        overflow = np.any((tmp_np > 0) & (full_mask == 0))
+                        if not overflow:
+                            # Commit draw if not test_only
+                            if not test_only:
+                                for ii, ln in enumerate(lns):
+                                    if not ln:
+                                        continue
+                                    ly = rsy + ii * (lh + sp)
+                                    zym0 = max(0, int(ly))
+                                    zym1 = min(region_mask.shape[0], int(ly + lh))
+                                    zm = region_mask[zym0:zym1, :]
+                                    rc = np.where(np.any(zm > 0, axis=0))[0]
+                                    if len(rc) > 0:
+                                        lcx = (int(rc[0]) + pad + int(rc[-1]) - pad) / 2.0
+                                    else:
+                                        lcx = fb_cx
+                                    bb = drw.textbbox((0, 0), ln, font=fnt)
+                                    lx = lcx - (bb[2] - bb[0]) / 2.0
+                                    drw.text((lx, ly), ln, fill=f_color, font=fnt)
+                            return False, cur_sz
+                        cur_sz -= 1
+
+                    return True, 6  # could not fit
+
+                # ── Find connected components in eroded mask ──────────────────
+                num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+                    eroded_mask, connectivity=8
+                )
+
+                # Collect non-background components sorted by area (largest first)
+                regions = []
+                for lbl in range(1, num_labels):
+                    area = stats[lbl, cv2.CC_STAT_AREA]
+                    if area < 200:
                         continue
-                    
-                    ly = sy + i * (line_h + line_spacing)
-                    
-                    zone_y_min = ly
-                    zone_y_max = ly + line_h
-                    
-                    zone_mask = eroded_mask[max(0, int(zone_y_min)):min(eroded_mask.shape[0], int(zone_y_max)), :]
-                    col_indices = np.where(np.any(zone_mask > 0, axis=0))[0]
-                    if len(col_indices) > 0:
-                        x_start = col_indices[0] + padding
-                        x_end = col_indices[-1] - padding
-                        cx = (x_start + x_end) / 2.0
+                    region_mask_i = (labels == lbl).astype(np.uint8) * 255
+                    bx_i = stats[lbl, cv2.CC_STAT_LEFT]
+                    by_i = stats[lbl, cv2.CC_STAT_TOP]
+                    bw_i = stats[lbl, cv2.CC_STAT_WIDTH]
+                    bh_i = stats[lbl, cv2.CC_STAT_HEIGHT]
+                    cx_i = bx_i + bw_i / 2.0
+                    cy_i = by_i + bh_i / 2.0
+                    regions.append({"mask": region_mask_i, "area": area,
+                                    "cx": cx_i, "cy": cy_i,
+                                    "bx": bx_i, "by": by_i, "bw": bw_i, "bh": bh_i})
+
+                if not regions:
+                    # Fallback: treat entire eroded mask as one region
+                    regions = [{"mask": eroded_mask, "area": int(np.sum(eroded_mask > 0)),
+                                "cx": eroded_mask.shape[1] / 2.0,
+                                "cy": eroded_mask.shape[0] / 2.0,
+                                "bx": 0, "by": 0,
+                                "bw": eroded_mask.shape[1],
+                                "bh": eroded_mask.shape[0]}]
+
+                # ── Determine sort axis: horizontal or vertical ───────────────
+                if len(regions) > 1:
+                    cx_vals = [r["cx"] for r in regions]
+                    cy_vals = [r["cy"] for r in regions]
+                    spread_x = max(cx_vals) - min(cx_vals)
+                    spread_y = max(cy_vals) - min(cy_vals)
+                    if spread_x >= spread_y:
+                        # side-by-side → sort left-to-right
+                        regions.sort(key=lambda r: r["cx"])
                     else:
-                        cx = bx + bw / 2.0
-                    
-                    bb = draw.textbbox((0, 0), line, font=font)
-                    lx = cx - (bb[2] - bb[0]) / 2.0
-                    draw.text((lx, ly), line, fill=text_c, font=font)
+                        # stacked → sort top-to-bottom
+                        regions.sort(key=lambda r: r["cy"])
+                else:
+                    regions.sort(key=lambda r: r["cy"])
+
+                # ── Split text across regions proportionally by area ──────────
+                total_area = sum(r["area"] for r in regions)
+                text_parts: List[str] = []
+                if "\n\n" in text:
+                    raw_parts = [p.strip() for p in text.split("\n\n") if p.strip()]
+                    if len(raw_parts) >= len(regions):
+                        text_parts = raw_parts
+                    else:
+                        text_parts = []  # will distribute below
+                if not text_parts:
+                    words = text.split()
+                    total_w = len(words)
+                    assigned = 0
+                    parts_tmp = []
+                    for idx_r, r in enumerate(regions):
+                        if idx_r == len(regions) - 1:
+                            parts_tmp.append(" ".join(words[assigned:]))
+                        else:
+                            n = max(1, int(round(r["area"] / total_area * total_w)))
+                            parts_tmp.append(" ".join(words[assigned:assigned + n]))
+                            assigned += n
+                    text_parts = parts_tmp
+
+                # Pad or trim to match region count
+                while len(text_parts) < len(regions):
+                    text_parts.append("")
+                text_parts = text_parts[:len(regions)]
+
+                # ── Draw each text part in its region ────────────────────────
+                for r, t_part in zip(regions, text_parts):
+                    if not t_part.strip():
+                        continue
+                    _draw_text_in_region(
+                        draw, r["mask"], eroded_mask,
+                        t_part, font_name, font_size, text_c,
+                        padding, line_spacing,
+                        test_only=False
+                    )
 
             # Output empty bubble image
             empty_batch.append(_p2t_rgba(empty_bubble))
