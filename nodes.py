@@ -542,3 +542,258 @@ class SpeechBubbleSettingsNode:
             text=text,
         )
         return (json.dumps(payload, ensure_ascii=False),)
+
+
+# ─── ComfyUI Node: SpeechBubbleExtractor ──────────────────────────────────────
+
+class SpeechBubbleExtractorNode:
+    """
+    🗨️ Speech Bubble Extractor
+    ──────────────────────────
+    Takes a masked speech bubble image (with text), erases the text to create
+    an empty speech bubble, optionally renders new text, and composites it
+    onto the original image.
+    """
+
+    RETURN_TYPES  = ("IMAGE", "IMAGE", "IMAGE")
+    RETURN_NAMES  = ("composited", "empty_bubble", "masked_bubble")
+    FUNCTION      = "run"
+    CATEGORY      = "image/speech_bubble"
+    OUTPUT_NODE   = False
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image":               ("IMAGE",),
+                "masked_bubble_image": ("IMAGE",),
+                "font_name":           (_list_fonts(),),
+                "font_size":           ("INT", {"default": 22, "min": 6,  "max": 200}),
+                "font_color":          ("STRING", {"default": "#000000"}),
+                "padding":             ("INT", {"default": 15, "min": 0,  "max": 200}),
+                "line_spacing":        ("INT", {"default": 4,  "min": 0,  "max": 50}),
+                "mask_blur":           ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+            },
+            "optional": {
+                "text":                ("STRING", {"default": "", "multiline": True}),
+                "erosion_margin":      ("INT", {"default": 15, "min": 0, "max": 100}),
+                "text_threshold":      ("INT", {"default": 150, "min": 0, "max": 255}),
+            }
+        }
+
+    def run(
+        self,
+        image: torch.Tensor,
+        masked_bubble_image: torch.Tensor,
+        font_name: str,
+        font_size: int,
+        font_color: str,
+        padding: int,
+        line_spacing: int,
+        mask_blur: float,
+        text: str = "",
+        erosion_margin: int = 15,
+        text_threshold: int = 150,
+    ):
+        import cv2
+        from PIL import ImageFilter
+
+        comp_batch: List[torch.Tensor]   = []
+        empty_batch: List[torch.Tensor]  = []
+        masked_batch: List[torch.Tensor] = []
+
+        for b in range(image.shape[0]):
+            # 1. Convert tensors to PIL Images
+            orig_pil = _t2p(image[b : b + 1])
+            
+            bubble_idx = b if b < masked_bubble_image.shape[0] else 0
+            bubble_pil = _t2p_rgba(masked_bubble_image[bubble_idx : bubble_idx + 1])
+
+            # Save input bubble for output
+            masked_batch.append(_p2t_rgba(bubble_pil))
+
+            # 2. Extract bubble mask
+            bubble_rgba = bubble_pil.convert("RGBA")
+            r, g, b_ch, a = bubble_rgba.split()
+            a_np = np.array(a)
+
+            # If alpha is uniform, threshold based on color to find bubble
+            if a_np.max() == a_np.min():
+                rgb_np = np.array(bubble_rgba.convert("RGB"))
+                mask_np = np.any(rgb_np < 250, axis=2).astype(np.uint8) * 255
+                contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                mask_filled = np.zeros_like(mask_np)
+                if contours:
+                    cv2.drawContours(mask_filled, contours, -1, 255, -1)
+                mask_np = mask_filled
+            else:
+                mask_np = a_np
+
+            # 3. Erase text via erosion + threshold + inpainting
+            if erosion_margin > 0:
+                kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (erosion_margin, erosion_margin))
+                eroded_mask = cv2.erode(mask_np, kernel, iterations=1)
+            else:
+                eroded_mask = mask_np
+
+            gray = np.array(bubble_rgba.convert("L"))
+            text_mask = (eroded_mask > 0) & (gray < text_threshold)
+
+            # Inpaint text area
+            img_bgr = cv2.cvtColor(np.array(bubble_rgba.convert("RGB")), cv2.COLOR_RGB2BGR)
+            text_mask_uint8 = text_mask.astype(np.uint8) * 255
+            
+            if np.any(text_mask_uint8 > 0):
+                inpainted_bgr = cv2.inpaint(img_bgr, text_mask_uint8, inpaintRadius=3, flags=cv2.INPAINT_TELEA)
+                inpainted_rgb = cv2.cvtColor(inpainted_bgr, cv2.COLOR_BGR2RGB)
+            else:
+                inpainted_rgb = np.array(bubble_rgba.convert("RGB"))
+
+            # Reconstruct the empty bubble RGBA image
+            empty_np = np.array(bubble_rgba)
+            empty_np[:, :, 0:3] = inpainted_rgb
+            # Ensure the bubble interior mask region has alpha = 255
+            empty_np[eroded_mask > 0, 3] = 255
+            empty_bubble = Image.fromarray(empty_np, "RGBA")
+
+            # 4. Draw new text if provided
+            if text.strip():
+                draw = ImageDraw.Draw(empty_bubble, "RGBA")
+                text_c = _hex_rgba(font_color, 255)
+                
+                # Find vertical range and average width of the bubble mask
+                row_indices = np.where(np.sum(eroded_mask > 0, axis=1) > 0)[0]
+                if len(row_indices) > 0:
+                    y_min, y_max = row_indices[0], row_indices[-1]
+                    row_widths = np.sum(eroded_mask > 0, axis=1)
+                    valid_row_widths = row_widths[row_widths > 0]
+                    avg_width = np.mean(valid_row_widths)
+                else:
+                    y_min, y_max = 0, bubble_rgba.height
+                    avg_width = bubble_rgba.width
+                
+                # Bounding box coordinates for fallbacks
+                contours, _ = cv2.findContours(eroded_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if contours:
+                    c = max(contours, key=cv2.contourArea)
+                    bx, by, bw, bh = cv2.boundingRect(c)
+                else:
+                    bx, by, bw, bh = 0, 0, bubble_rgba.width, bubble_rgba.height
+                
+                current_size = font_size
+                min_size = 6
+                
+                # Auto-adjust font size
+                while current_size >= min_size:
+                    font = _load_font(font_name, current_size)
+                    
+                    # Wrap text based on average width
+                    wrap_w = max(50, int(avg_width - 2 * padding))
+                    lines = _wrap_text(draw, text, font, wrap_w)
+                    L = len(lines)
+                    
+                    if L == 0:
+                        break
+                    
+                    # Test drawing
+                    test_img = Image.new("L", (empty_bubble.width, empty_bubble.height), 0)
+                    test_draw = ImageDraw.Draw(test_img)
+                    
+                    bb0 = test_draw.textbbox((0, 0), "Ag", font=font)
+                    line_h = bb0[3] - bb0[1]
+                    total_h = L * line_h + (L - 1) * line_spacing
+                    
+                    cy = (y_min + y_max) / 2.0
+                    sy = cy - total_h / 2.0
+                    
+                    # For each line, compute its Y and X position
+                    for i, line in enumerate(lines):
+                        if not line:
+                            continue
+                        
+                        ly = sy + i * (line_h + line_spacing)
+                        
+                        # Get horizontal center of the mask in this line's vertical range
+                        zone_y_min = ly
+                        zone_y_max = ly + line_h
+                        
+                        zone_mask = eroded_mask[max(0, int(zone_y_min)):min(eroded_mask.shape[0], int(zone_y_max)), :]
+                        col_indices = np.where(np.any(zone_mask > 0, axis=0))[0]
+                        if len(col_indices) > 0:
+                            x_start = col_indices[0] + padding
+                            x_end = col_indices[-1] - padding
+                            cx = (x_start + x_end) / 2.0
+                        else:
+                            cx = bx + bw / 2.0
+                        
+                        bb = test_draw.textbbox((0, 0), line, font=font)
+                        lx = cx - (bb[2] - bb[0]) / 2.0
+                        test_draw.text((lx, ly), line, fill=255, font=font)
+                    
+                    test_np = np.array(test_img)
+                    overflow_pixels = np.any((test_np > 0) & (eroded_mask == 0))
+                    
+                    if not overflow_pixels:
+                        break
+                    
+                    current_size -= 1
+                
+                # Draw the final text using the determined font size
+                font = _load_font(font_name, current_size)
+                wrap_w = max(50, int(avg_width - 2 * padding))
+                lines = _wrap_text(draw, text, font, wrap_w)
+                L = len(lines)
+                
+                bb0 = draw.textbbox((0, 0), "Ag", font=font)
+                line_h = bb0[3] - bb0[1]
+                total_h = L * line_h + (L - 1) * line_spacing
+                
+                cy = (y_min + y_max) / 2.0
+                sy = cy - total_h / 2.0
+                
+                for i, line in enumerate(lines):
+                    if not line:
+                        continue
+                    
+                    ly = sy + i * (line_h + line_spacing)
+                    
+                    zone_y_min = ly
+                    zone_y_max = ly + line_h
+                    
+                    zone_mask = eroded_mask[max(0, int(zone_y_min)):min(eroded_mask.shape[0], int(zone_y_max)), :]
+                    col_indices = np.where(np.any(zone_mask > 0, axis=0))[0]
+                    if len(col_indices) > 0:
+                        x_start = col_indices[0] + padding
+                        x_end = col_indices[-1] - padding
+                        cx = (x_start + x_end) / 2.0
+                    else:
+                        cx = bx + bw / 2.0
+                    
+                    bb = draw.textbbox((0, 0), line, font=font)
+                    lx = cx - (bb[2] - bb[0]) / 2.0
+                    draw.text((lx, ly), line, fill=text_c, font=font)
+
+            # Output empty bubble image
+            empty_batch.append(_p2t_rgba(empty_bubble))
+
+            # 5. Composite empty bubble onto original image
+            if mask_blur > 0.0:
+                r_ch, g_ch, b_ch, a_ch = empty_bubble.split()
+                a_blurred = a_ch.filter(ImageFilter.GaussianBlur(mask_blur))
+                empty_bubble_blurred = Image.merge("RGBA", (r_ch, g_ch, b_ch, a_blurred))
+            else:
+                empty_bubble_blurred = empty_bubble
+
+            # Resize bubble to match original image dimensions if they differ
+            if empty_bubble_blurred.size != orig_pil.size:
+                empty_bubble_blurred = empty_bubble_blurred.resize(orig_pil.size, Image.LANCZOS)
+
+            comp_pil = Image.alpha_composite(orig_pil.convert("RGBA"), empty_bubble_blurred).convert("RGB")
+            comp_batch.append(_p2t_rgb(comp_pil))
+
+        return (
+            torch.cat(comp_batch, dim=0),
+            torch.cat(empty_batch, dim=0),
+            torch.cat(masked_batch, dim=0),
+        )
+
